@@ -1,0 +1,55 @@
+name:                circuit-breaker
+version:             0.1.0.0
+github:              "ChrisCoffey/circuit-breaker"
+license:             BSD3
+author:              "Chris Coffey"
+maintainer:          "chris@foldl.io"
+copyright:           "2019 Chris Coffey"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+# Metadata used when publishing your package
+synopsis:            An implementation of the "circuit breaker" pattern to disable repeated calls to a failing system
+category:            System
+
+description:         Please see the README on GitHub at <https://github.com/ChrisCoffey/circuit-breaker#readme>
+
+dependencies:
+- base >= 4.7 && < 5
+- unliftio
+- unliftio-core
+- mtl
+- text
+- transformers
+- time
+- unordered-containers
+
+default-extensions: GADTs FlexibleInstances DataKinds MultiParamTypeClasses FunctionalDependencies
+    TypeApplications KindSignatures ScopedTypeVariables
+
+library:
+  source-dirs: src
+
+executables:
+  circuit-breaker-exe:
+    main:                Main.hs
+    source-dirs:         app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - circuit-breaker
+
+tests:
+  circuit-breaker-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - circuit-breaker
