@@ -10,7 +10,7 @@ import Numeric.Natural (Natural)
 import GHC.TypeLits (Symbol, KnownSymbol, symbolVal, Nat, KnownNat, natVal)
 import Data.Proxy (Proxy(..))
 import UnliftIO.Exception (bracketOnError, catchDeep)
-import UnliftIO.MVar (MVar, putMVar, takeMVar, newMVar)
+import UnliftIO.MVar (MVar, putMVar, takeMVar, newMVar, swapMVar)
 import qualified Data.Text as T
 import qualified Data.HashMap.Strict as M
 
@@ -123,15 +123,17 @@ withBreaker breakerDefinition action = do
                     putMVar bs cb
                     pure SkipClosed
 
-        during _ _ (Run _) =
-            Right <$> action
+        during _ bs (Run _) = do
+            res <- Right <$> action
+            swapMVar bs $ CircuitState {mostRecentError = Nothing, currentState = Active}
+            pure res
+
         during lbl bs SkipClosed =
             pure . Left $ CircuitBreakerClosed lbl
 
         -- In the event of an uncaught error during the bracketed computation, flip the circuit breaker to 'Waiting'
-        onError bs (Run ts) = do
-            bs' <- takeMVar bs
-            putMVar bs $ CircuitState {mostRecentError = Just ts, currentState = Waiting}
+        onError bs (Run ts) =
+            swapMVar bs $ CircuitState {mostRecentError = Just ts, currentState = Waiting}
 
 
 newBreaker :: CircuitState
