@@ -27,7 +27,7 @@ dependencies:
 - unordered-containers
 
 default-extensions: GADTs FlexibleInstances DataKinds MultiParamTypeClasses FunctionalDependencies
-    TypeApplications KindSignatures ScopedTypeVariables
+    TypeApplications KindSignatures ScopedTypeVariables TypeFamilies
 
 library:
   source-dirs: src
