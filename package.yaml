@@ -25,12 +25,17 @@ dependencies:
 - transformers
 - time
 - unordered-containers
+- random
 
 default-extensions: GADTs FlexibleInstances DataKinds MultiParamTypeClasses FunctionalDependencies
-    TypeApplications KindSignatures ScopedTypeVariables TypeFamilies
+    TypeApplications KindSignatures ScopedTypeVariables TypeFamilies ExistentialQuantification
 
 library:
   source-dirs: src
+  exported-modules:
+      System.CircuitBreaker
+      System.CircuitBreaker.Monitor
+      System.CircuitBreaker.Management
 
 executables:
   circuit-breaker-exe:

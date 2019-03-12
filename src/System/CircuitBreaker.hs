@@ -1,9 +1,29 @@
+-- |
+-- Module:          System.CircuitBreaker
+-- Copyright:       (c) 2019 Chris Coffey
+-- License:         MIT
+-- Maintainer:      chris@foldl.io
+-- Stability:       experimental
+-- Portability:     portable
+--
+-- This is a batteries mostly-included circuit breaker library. There are several types of circuit
+-- breakers exposed.
+
+
 module System.CircuitBreaker (
+    CBCondition(..),
+    CircuitBreakerConf,
+    CircuitBreaker,
+    CircutBreakerError(..),
+    HasCircuitConf(..),
+
+    withBreaker,
+    initialBreakerState
 ) where
 
 import Control.Monad.Trans (liftIO)
 import Control.Monad.IO.Unlift (MonadUnliftIO)
-import Control.Monad.Reader (MonadReader, asks)
+import Control.Monad.Reader (MonadReader, asks, ReaderT, ask)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Time.Clock (UTCTime, getCurrentTime, addUTCTime)
 import Numeric.Natural (Natural)
@@ -18,6 +38,12 @@ newtype CircuitBreakerConf = CBConf {
     cbBreakers :: MVar (M.HashMap T.Text (MVar CircuitState))
     }
 
+-- | Initialize the storage for the process' circuit breakers
+initialBreakerState :: MonadUnliftIO m => m CircuitBreakerConf
+initialBreakerState = do
+    mv <- newMVar M.empty
+    pure CBConf {cbBreakers = mv}
+
 -- | The current condition of a CircutBreaker may be Active, Testing, or Waiting for the
 -- timeout to elapse.
 data CBCondition
@@ -26,28 +52,33 @@ data CBCondition
     | Waiting
     deriving (Show, Eq, Ord, Bounded, Enum)
 
-
 data CircuitState = CircuitState {
-      mostRecentError :: !(Maybe UTCTime)
+      errorCount :: Natural
     , currentState :: !CBCondition
-    -- , currentlyTesting :: MVar Bool
     } deriving (Show)
 
 -- | A constraint that allows pullng the circuit breaker
 class HasCircuitConf env where
     getCircuitState :: env -> CircuitBreakerConf
 
+instance HasCircuitConf CircuitBreakerConf where
+    getCircuitState = id
+
+newtype ErrorThreshold = ET Natural
+newtype DripFreq = DF Natural
+
 -- | Access a Circut Breaker's label at runtime
-reifyCircuitBreaker :: forall label timeout. (KnownSymbol label, KnownNat timeout) =>
-    CircuitBreaker label timeout
-    -> (T.Text, Natural)
-reifyCircuitBreaker _ = (l, t)
+reifyCircuitBreaker :: forall label df et. (KnownSymbol label, KnownNat df, KnownNat et) =>
+    CircuitBreaker label df et
+    -> (T.Text, DripFreq, ErrorThreshold)
+reifyCircuitBreaker _ = (l, df, et)
     where
         l = T.pack $ symbolVal (Proxy :: Proxy label)
-        t = fromIntegral $ natVal (Proxy :: Proxy timeout)
+        df = DF . fromIntegral $ natVal (Proxy :: Proxy df)
+        et = ET . fromIntegral $ natVal (Proxy :: Proxy et)
 
--- | The definition of a particular circuit breaker.
-data CircuitBreaker (a :: Symbol) (b :: Nat)
+-- | The definition of a particular circuit breaker
+data CircuitBreaker (label :: Symbol) (dripFreq :: Nat) (errorThreshold :: Nat)
 
 data CircutBreakerError
     = Failed
@@ -59,29 +90,35 @@ data CircutAction
     | Run UTCTime
     deriving (Eq, Show)
 
+
 -- | Brackets a computation with short-circuit logic. If an uncaught error occurs, then the
 -- circuit breaker opens, which causes all additional threads entering the wrapped code to fail
 -- until the specified timeout has expired. Once the timeout expires, a single thread may enter
 -- the protected region. If the call succeeds, then the circuit breaker allows all other traffic
 -- through. Otherwise, it resets the timeout, after which the above algorithm repeats.
-withBreaker :: (Monad m, MonadUnliftIO m, MonadReader env m,
-    HasCircuitConf env, KnownSymbol label, KnownNat timeout) =>
-    CircuitBreaker label timeout
+--
+-- Important Note: This does not catch errors. If an IO error is thrown, it will bubble up from
+-- this function. Internally, if the breaker is tripped, it will prevent further calls
+withBreaker :: (KnownSymbol label, KnownNat df, KnownNat et, Monad m,
+    MonadUnliftIO m, MonadReader env m, HasCircuitConf env) =>
+    CircuitBreaker label df et
     -> m a
     -> m (Either CircutBreakerError a)
 withBreaker breakerDefinition action = do
     -- Get the current circut breaker
     breakerCell <- cbBreakers <$> asks getCircuitState
     breakers <- takeMVar breakerCell
-    let (lbl, timeout) = reifyCircuitBreaker breakerDefinition
-        mbs = lbl `M.lookup` breakers
+    let mbs = label `M.lookup` breakers
+        newBreaker = CircuitState {
+            errorCount = 0,
+            currentState = Active
+            }
     bs <- maybe (newMVar newBreaker) pure mbs
 
     -- If it happens to be the first time this block has been called, store the new breakers state
     if isNothing mbs
-        then putMVar breakerCell $ M.insert lbl bs breakers
+        then putMVar breakerCell $ M.insert label bs breakers
         else  putMVar breakerCell breakers
-
     -- bracketOnError the action
     -- Read the current status & determine whether to perform the action
     --      0) Get the current time
@@ -91,9 +128,9 @@ withBreaker breakerDefinition action = do
     --          4) If the timeout has elapsed, enter 'Testing' state
     --          5) Otherwise, run the computation
     --      6) If the computation fails, set the error time and enter 'Waiting' state
-    bracketOnError (before bs) (onError bs) (during lbl bs)
+    bracketOnError (before bs) (onError bs) (during label bs)
     where
-        (label, timeout) = reifyCircuitBreaker breakerDefinition
+        (label, _, ET et) = reifyCircuitBreaker breakerDefinition
 
         -- Given the current state of the circuit breaker, determine what action should
         -- be taken during the body of the 'bracket'.
@@ -106,9 +143,7 @@ withBreaker breakerDefinition action = do
         before bs = do
             now <- liftIO getCurrentTime
             cb <- takeMVar bs
-            let threshold = addUTCTime (- (fromIntegral timeout)) now
-                elapsed = fromMaybe False $ (threshold >) <$> mostRecentError cb
-            putMVar bs cb
+            let elapsed = errorCount cb < fromIntegral et
             case currentState cb of
                 Waiting | elapsed -> do
                     putMVar bs $ cb {currentState = Testing}
@@ -123,43 +158,23 @@ withBreaker breakerDefinition action = do
                     putMVar bs cb
                     pure SkipClosed
 
+        -- The body of the bracket
         during _ bs (Run _) = do
+            liftIO $ print "doing the thing"
             res <- Right <$> action
-            swapMVar bs $ CircuitState {mostRecentError = Nothing, currentState = Active}
+            swapMVar bs $ CircuitState {currentState = Active}
+            liftIO $ print "It worked"
             pure res
 
-        during lbl bs SkipClosed =
+        during lbl bs SkipClosed = do
+            liftIO $ print "skipping"
             pure . Left $ CircuitBreakerClosed lbl
 
         -- In the event of an uncaught error during the bracketed computation, flip the circuit breaker to 'Waiting'
-        onError bs (Run ts) =
-            swapMVar bs $ CircuitState {mostRecentError = Just ts, currentState = Waiting}
-
-
-newBreaker :: CircuitState
-newBreaker = CircuitState {
-    mostRecentError = Nothing,
-    currentState = Active
-    }
-
-testBreaker ::
-    CircuitState
-    -> CircuitState
-testBreaker cb = cb {currentState = Testing}
-
-failedTest ::
-    UTCTime
-    -> CircuitState
-    -> CircuitState
-failedTest errorTime cb = CircuitState {
-    mostRecentError = Just errorTime
-    , currentState = Waiting
-    }
-
-passedTest ::
-    CircuitState
-    -> CircuitState
-passedTest cb = CircuitState {
-    mostRecentError = Nothing,
-    currentState = Active
-    }
+        onError bs (Run ts) = do
+            liftIO $ print "failed"
+            bs' <- takeMVar bs
+            let ec' = 1 + errorCount bs'
+                state = if ec' >= et then Waiting else Active
+            putMVar bs $ CircuitState {errorCount = ec', currentState = state}
+            liftIO $ print "done failing"
