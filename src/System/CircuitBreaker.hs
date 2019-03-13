@@ -12,10 +12,11 @@
 
 module System.CircuitBreaker (
     CBCondition(..),
-    CircuitBreakerConf,
+    CircuitBreakerConf(..),
     CircuitBreaker,
     CircutBreakerError(..),
     HasCircuitConf(..),
+    CircuitState(..), -- TODO move this into a private module
 
     withBreaker,
     initialBreakerState
