@@ -6,9 +6,7 @@
 -- Stability:       experimental
 -- Portability:     portable
 --
--- This is a batteries mostly-included circuit breaker library. There are several types of circuit
--- breakers exposed.
-
+-- This is a batteries mostly-included circuit breaker library.
 
 module System.CircuitBreaker (
     CBCondition(..),
@@ -16,13 +14,16 @@ module System.CircuitBreaker (
     CircuitBreaker,
     CircutBreakerError(..),
     HasCircuitConf(..),
-    CircuitState(..), -- TODO move this into a private module
+    CircuitState(..),
+    CircuitAction(..),
+    ErrorThreshold(..),
 
     withBreaker,
     initialBreakerState,
     -- | Exported for testing
     breakerTransitionGuard,
-    breakerTryPerformAction
+    breakerTryPerformAction,
+    decrementErrorCount
 ) where
 
 import Control.Monad (forever, void)
@@ -30,7 +31,6 @@ import Control.Monad.Trans (liftIO)
 import Control.Monad.IO.Unlift (MonadUnliftIO)
 import Control.Monad.Reader (MonadReader, asks, ReaderT, ask)
 import Data.Maybe (fromMaybe, isNothing)
-import Data.Time.Clock (UTCTime, getCurrentTime, addUTCTime)
 import Numeric.Natural (Natural)
 import GHC.TypeLits (Symbol, KnownSymbol, symbolVal, Nat, KnownNat, natVal)
 import Data.Proxy (Proxy(..))
@@ -80,7 +80,7 @@ reifyCircuitBreaker :: forall label df et. (KnownSymbol label, KnownNat df, Know
 reifyCircuitBreaker _ = (l, df, et)
     where
         l = T.pack $ symbolVal (Proxy :: Proxy label)
-        df = DF . fromIntegral $ natVal (Proxy :: Proxy df)
+        df = DF . (* 1000) . fromIntegral $ natVal (Proxy :: Proxy df)
         et = ET . fromIntegral $ natVal (Proxy :: Proxy et)
 
 -- | The definition of a particular circuit breaker
@@ -93,7 +93,7 @@ data CircutBreakerError
 
 data CircuitAction
     = SkipClosed
-    | Run UTCTime
+    | Run
     deriving (Eq, Show)
 
 
@@ -142,13 +142,11 @@ withBreaker breakerDefinition action = do
         (label, DF dripFreq, ET et) = reifyCircuitBreaker breakerDefinition
 
         -- In the event of an uncaught error during the bracketed computation, flip the circuit breaker to 'Waiting'
-        onError bs (Run ts) = do
-            liftIO $ print "failed"
+        onError bs (Run) = do
             bs' <- takeMVar bs
             let ec' = 1 + errorCount bs'
                 state = if ec' >= et then Waiting else Active
             putMVar bs $ CircuitState {errorCount = ec', currentState = state}
-            liftIO $ print "done failing"
 
         -- Run a
         monitor bs =
@@ -169,16 +167,15 @@ breakerTransitionGuard :: (MonadUnliftIO m) =>
     -> ErrorThreshold
     -> m CircuitAction
 breakerTransitionGuard bs (ET et) = do
-    now <- liftIO getCurrentTime
     cb <- takeMVar bs
     let elapsed = errorCount cb < fromIntegral et
     case currentState cb of
         Waiting | elapsed -> do
             putMVar bs $ cb {currentState = Testing}
-            pure $ Run now
+            pure $ Run
         Active -> do
             putMVar bs cb
-            pure $ Run now
+            pure $ Run
         Waiting -> do
             putMVar bs cb
             pure SkipClosed
@@ -195,9 +192,10 @@ breakerTryPerformAction :: MonadUnliftIO m =>
     -> m (Either CircutBreakerError a)
 breakerTryPerformAction label _ _ SkipClosed =
     pure . Left $ CircuitBreakerClosed label
-breakerTryPerformAction label action bs (Run _) = do
+breakerTryPerformAction label action bs Run = do
     res <- Right <$> action
-    swapMVar bs $ CircuitState {currentState = Active}
+    bs' <- takeMVar bs
+    putMVar bs (bs' {currentState = Active})
     pure res
 
 -- | Decrements a counter

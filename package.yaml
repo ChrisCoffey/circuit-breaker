@@ -29,6 +29,7 @@ dependencies:
 
 default-extensions: GADTs FlexibleInstances DataKinds MultiParamTypeClasses FunctionalDependencies
     TypeApplications KindSignatures ScopedTypeVariables TypeFamilies ExistentialQuantification
+    OverloadedStrings
 
 library:
   source-dirs: src
@@ -57,3 +58,8 @@ tests:
     - -with-rtsopts=-N
     dependencies:
     - circuit-breaker
+    - tasty
+    - tasty-hunit
+    - tasty-quickcheck
+    - QuickCheck
+    - quickcheck-instances
