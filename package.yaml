@@ -1,7 +1,7 @@
 name:                circuit-breaker
-version:             0.1.0.0
+version:             0.1.0.1
 github:              "ChrisCoffey/circuit-breaker"
-license:             BSD3
+license:             MIT
 author:              "Chris Coffey"
 maintainer:          "chris@foldl.io"
 copyright:           "2019 Chris Coffey"
@@ -11,7 +11,7 @@ extra-source-files:
 - ChangeLog.md
 
 # Metadata used when publishing your package
-synopsis:            An implementation of the "circuit breaker" pattern to disable repeated calls to a failing system
+synopsis:            An implementation of the "circuit breaker" pattern
 category:            System
 
 description:         Please see the README on GitHub at <https://github.com/ChrisCoffey/circuit-breaker#readme>
