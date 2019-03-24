@@ -34,7 +34,6 @@ library:
   source-dirs: src
   exported-modules:
       System.CircuitBreaker
-      System.CircuitBreaker.Monitor
       System.CircuitBreaker.Management
 
 executables:

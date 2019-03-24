@@ -19,9 +19,13 @@ module System.CircuitBreaker (
     CircuitState(..), -- TODO move this into a private module
 
     withBreaker,
-    initialBreakerState
+    initialBreakerState,
+    -- | Exported for testing
+    breakerTransitionGuard,
+    breakerTryPerformAction
 ) where
 
+import Control.Monad (forever, void)
 import Control.Monad.Trans (liftIO)
 import Control.Monad.IO.Unlift (MonadUnliftIO)
 import Control.Monad.Reader (MonadReader, asks, ReaderT, ask)
@@ -30,6 +34,7 @@ import Data.Time.Clock (UTCTime, getCurrentTime, addUTCTime)
 import Numeric.Natural (Natural)
 import GHC.TypeLits (Symbol, KnownSymbol, symbolVal, Nat, KnownNat, natVal)
 import Data.Proxy (Proxy(..))
+import UnliftIO.Concurrent (forkIO, threadDelay)
 import UnliftIO.Exception (bracketOnError, catchDeep)
 import UnliftIO.MVar (MVar, putMVar, takeMVar, newMVar, swapMVar)
 import qualified Data.Text as T
@@ -86,7 +91,7 @@ data CircutBreakerError
     | CircuitBreakerClosed T.Text
     deriving (Show, Eq, Ord)
 
-data CircutAction
+data CircuitAction
     = SkipClosed
     | Run UTCTime
     deriving (Eq, Show)
@@ -116,9 +121,12 @@ withBreaker breakerDefinition action = do
             }
     bs <- maybe (newMVar newBreaker) pure mbs
 
-    -- If it happens to be the first time this block has been called, store the new breakers state
+    -- If it happens to be the first time this block has been called, store the new breakers state.
+    -- Also initialize a monitor thread to drip errors
     if isNothing mbs
-        then putMVar breakerCell $ M.insert label bs breakers
+        then do
+            putMVar breakerCell $ M.insert label bs breakers
+            monitor bs
         else  putMVar breakerCell breakers
     -- bracketOnError the action
     -- Read the current status & determine whether to perform the action
@@ -129,47 +137,9 @@ withBreaker breakerDefinition action = do
     --          4) If the timeout has elapsed, enter 'Testing' state
     --          5) Otherwise, run the computation
     --      6) If the computation fails, set the error time and enter 'Waiting' state
-    bracketOnError (before bs) (onError bs) (during label bs)
+    bracketOnError (breakerTransitionGuard bs (ET et)) (onError bs) (breakerTryPerformAction label action bs)
     where
-        (label, _, ET et) = reifyCircuitBreaker breakerDefinition
-
-        -- Given the current state of the circuit breaker, determine what action should
-        -- be taken during the body of the 'bracket'.
-        --
-        -- Condition rules:
-        -- 1) If the circuit breaker is in 'Active' then pass the call on
-        -- 2) If the circuit breaker is in 'Testing' then fail the call
-        -- 3) If the circuit breaker is in 'Waiting' and the timeout has not elapsed then fail the call
-        -- 4) If the circuit breaker is in 'Waiting' and the timeout has elapsed then convert to 'Testing' and try the call
-        before bs = do
-            now <- liftIO getCurrentTime
-            cb <- takeMVar bs
-            let elapsed = errorCount cb < fromIntegral et
-            case currentState cb of
-                Waiting | elapsed -> do
-                    putMVar bs $ cb {currentState = Testing}
-                    pure $ Run now
-                Active -> do
-                    putMVar bs cb
-                    pure $ Run now
-                Waiting -> do
-                    putMVar bs cb
-                    pure SkipClosed
-                Testing -> do
-                    putMVar bs cb
-                    pure SkipClosed
-
-        -- The body of the bracket
-        during _ bs (Run _) = do
-            liftIO $ print "doing the thing"
-            res <- Right <$> action
-            swapMVar bs $ CircuitState {currentState = Active}
-            liftIO $ print "It worked"
-            pure res
-
-        during lbl bs SkipClosed = do
-            liftIO $ print "skipping"
-            pure . Left $ CircuitBreakerClosed lbl
+        (label, DF dripFreq, ET et) = reifyCircuitBreaker breakerDefinition
 
         -- In the event of an uncaught error during the bracketed computation, flip the circuit breaker to 'Waiting'
         onError bs (Run ts) = do
@@ -179,3 +149,64 @@ withBreaker breakerDefinition action = do
                 state = if ec' >= et then Waiting else Active
             putMVar bs $ CircuitState {errorCount = ec', currentState = state}
             liftIO $ print "done failing"
+
+        -- Run a
+        monitor bs =
+            void . forkIO . forever $ do
+                threadDelay $ fromIntegral dripFreq
+                decrementErrorCount bs
+
+-- | Given the current state of the circuit breaker, determine what action should
+-- be taken during the body of the 'bracket'.
+--
+-- Condition rules:
+-- 1) If the circuit breaker is in 'Active' then pass the call on
+-- 2) If the circuit breaker is in 'Testing' then fail the call
+-- 3) If the circuit breaker is in 'Waiting' and the timeout has not elapsed then fail the call
+-- 4) If the circuit breaker is in 'Waiting' and the timeout has elapsed then convert to 'Testing' and try the call
+breakerTransitionGuard :: (MonadUnliftIO m) =>
+    MVar CircuitState
+    -> ErrorThreshold
+    -> m CircuitAction
+breakerTransitionGuard bs (ET et) = do
+    now <- liftIO getCurrentTime
+    cb <- takeMVar bs
+    let elapsed = errorCount cb < fromIntegral et
+    case currentState cb of
+        Waiting | elapsed -> do
+            putMVar bs $ cb {currentState = Testing}
+            pure $ Run now
+        Active -> do
+            putMVar bs cb
+            pure $ Run now
+        Waiting -> do
+            putMVar bs cb
+            pure SkipClosed
+        Testing -> do
+            putMVar bs cb
+            pure SkipClosed
+
+-- | Conditionally performs an action with in a circuit breaker, as determined by the current breaker state.
+breakerTryPerformAction :: MonadUnliftIO m =>
+    T.Text -- ^ label
+    -> m a -- ^ Action to perform
+    -> MVar CircuitState -- ^ Pointer to the breaker state
+    -> CircuitAction
+    -> m (Either CircutBreakerError a)
+breakerTryPerformAction label _ _ SkipClosed =
+    pure . Left $ CircuitBreakerClosed label
+breakerTryPerformAction label action bs (Run _) = do
+    res <- Right <$> action
+    swapMVar bs $ CircuitState {currentState = Active}
+    pure res
+
+-- | Decrements a counter
+decrementErrorCount :: MonadUnliftIO m =>
+    MVar CircuitState
+    -> m ()
+decrementErrorCount breaker = do
+    rawState <- takeMVar breaker
+    let ec = errorCount rawState
+    if ec == 0
+    then putMVar breaker rawState
+    else putMVar breaker $ rawState {errorCount = ec -1}
