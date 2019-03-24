@@ -6,19 +6,25 @@
 -- Stability:       experimental
 -- Portability:     portable
 --
--- This is a batteries mostly-included circuit breaker library.
+-- This is a batteries mostly-included circuit breaker library. It provides automatic backoff behavior by
+-- preventing calls to a failing resource. For example, if a particular service is currently overloaded and
+-- begins failing to respond to requests, then the circuit breaker will detect those errors and prevent
+-- further calls from actually hitting the server in question. Once the service has had a chance to stabilize
+-- the circuit breaker will allow a "testing" call to pass through. If it succeeds, then all other calls are
+-- allowed to flow through. If it fails then it waits a bit longer before testing again.
 
 module System.CircuitBreaker (
-    CBCondition(..),
-    CircuitBreakerConf(..),
     CircuitBreaker,
+    CircuitBreakerConf(..),
+    withBreaker,
+
     CircutBreakerError(..),
     HasCircuitConf(..),
     CircuitState(..),
     CircuitAction(..),
     ErrorThreshold(..),
+    CBCondition(..),
 
-    withBreaker,
     initialBreakerState,
     -- | Exported for testing
     breakerTransitionGuard,
@@ -142,7 +148,7 @@ withBreaker breakerDefinition action = do
         (label, DF dripFreq, ET et) = reifyCircuitBreaker breakerDefinition
 
         -- In the event of an uncaught error during the bracketed computation, flip the circuit breaker to 'Waiting'
-        onError bs (Run) = do
+        onError bs Run = do
             bs' <- takeMVar bs
             let ec' = 1 + errorCount bs'
                 state = if ec' >= et then Waiting else Active
@@ -172,10 +178,10 @@ breakerTransitionGuard bs (ET et) = do
     case currentState cb of
         Waiting | elapsed -> do
             putMVar bs $ cb {currentState = Testing}
-            pure $ Run
+            pure Run
         Active -> do
             putMVar bs cb
-            pure $ Run
+            pure Run
         Waiting -> do
             putMVar bs cb
             pure SkipClosed
